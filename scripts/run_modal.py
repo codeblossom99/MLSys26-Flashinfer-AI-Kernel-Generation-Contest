@@ -23,24 +23,43 @@ from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 app = modal.App("flashinfer-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
-TRACE_SET_PATH = "/data"
+# Volume always mounted at /data. Trace set root: /data/mlsys26-contest if you put parent dir,
+# or /data if you put mlsys26-contest contents directly at volume root.
+TRACE_SET_PATH = "/data/mlsys26-contest"
+VOLUME_MOUNT_PATH = "/data"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("flashinfer-bench", "torch", "triton", "numpy")
 )
 
+# B200 first for benchmark; fallback to H100/A100 if B200 unavailable (e.g. Triton compat)
+GPU_FALLBACK = ["B200", "H100", "A100"]
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+
+@app.function(image=image, gpu=GPU_FALLBACK, timeout=3600, volumes={VOLUME_MOUNT_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
+    # Try trace set path; fallback to volume root if empty (e.g. put mlsys26-contest contents at root)
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
+    if not trace_set.definitions and TRACE_SET_PATH != VOLUME_MOUNT_PATH:
+        trace_set = TraceSet.from_path(VOLUME_MOUNT_PATH)
 
     if solution.definition not in trace_set.definitions:
-        raise ValueError(f"Definition '{solution.definition}' not found in trace set")
+        available = sorted(trace_set.definitions.keys()) if trace_set.definitions else []
+        hint = (
+            "Trace set is empty. Upload the mlsys26-contest dataset to the Modal volume:\n"
+            "  modal volume put flashinfer-trace /path/to/mlsys26-contest\n"
+            "Use the directory containing definitions/ and workloads/ (e.g. mlsys26-contest clone)."
+        ) if not available else (
+            f"Available definitions: {available[:20]}{'...' if len(available) > 20 else ''}"
+        )
+        raise ValueError(
+            f"Definition '{solution.definition}' not found in trace set. {hint}"
+        )
 
     definition = trace_set.definitions[solution.definition]
     workloads = trace_set.workloads.get(solution.definition, [])
