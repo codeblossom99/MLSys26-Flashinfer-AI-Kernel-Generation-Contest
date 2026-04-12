@@ -41,7 +41,7 @@ GPU_FALLBACK = ["B200", "H100", "A100"]
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config = BenchmarkConfig(warmup_runs=1, iterations=5, num_trials=3)
 
     # Try trace set path; fallback to volume root if empty (e.g. put mlsys26-contest contents at root)
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
@@ -121,6 +121,32 @@ def print_results(results: dict):
             print()
 
 
+def save_results(results: dict, solution_name: str, definition: str):
+    """Save benchmark results to a JSON file."""
+    import json
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = PROJECT_ROOT / "results" / f"{definition}_{solution_name}_{timestamp}.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    output = {
+        "solution_name": solution_name,
+        "definition": definition,
+        "timestamp": timestamp,
+        "gpu": "B200 (Modal)",
+        "benchmark_config": {
+            "warmup_runs": 1,
+            "iterations": 5,
+            "num_trials": 3,
+        },
+        "results": results,
+    }
+
+    output_path.write_text(json.dumps(output, indent=2))
+    print(f"\nResults saved to {output_path}")
+
+
 @app.local_entrypoint()
 def main():
     """Pack solution and run benchmark on Modal."""
@@ -141,3 +167,4 @@ def main():
         return
 
     print_results(results)
+    save_results(results, solution.name, solution.definition)
