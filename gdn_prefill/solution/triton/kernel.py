@@ -343,7 +343,7 @@ def gdn_prefill_chunk_kernel(
 
     for chunk_idx in range(max_num_chunks):
         chunk_base = seq_start + chunk_idx * CHUNK_SIZE
-        for step in tl.static_range(0, CHUNK_SIZE):
+        for step in range(CHUNK_SIZE):
             token_idx = chunk_base + step
             active = token_idx < seq_end
 
