@@ -1,0 +1,8 @@
+[solution]
+name = "wombat-tw-v1"      # Solution name
+definition = "gdn_prefill_qk4_v8_d128_k_last"          # Track: fused_moe | sparse_attention | gated_delta_net
+author = "Wombat TW"              # Team/author name
+
+[build]
+language = "triton"               # triton | cuda
+entry_point = "kernel.py::gdn_prefill"            # Kernel function name
