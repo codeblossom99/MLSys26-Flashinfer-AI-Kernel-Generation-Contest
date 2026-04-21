@@ -34,7 +34,7 @@ image = (
 )
 
 # B200 first for benchmark; fallback to H100/A100 if B200 unavailable (e.g. Triton compat)
-GPU_FALLBACK = ["B200", "H100", "A100"]
+GPU_FALLBACK = ["B200"]
 
 
 @app.function(image=image, gpu=GPU_FALLBACK, timeout=3600, volumes={VOLUME_MOUNT_PATH: trace_volume})
