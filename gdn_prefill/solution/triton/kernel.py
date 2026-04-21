@@ -435,14 +435,28 @@ def gdn_prefill(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output=
     if num_seqs == 0 or total_seq_len == 0:
         return output, new_state
 
-    chunk_size = 64
-    BLOCK_V = 32
-    num_v_tiles = head_size // BLOCK_V
-
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     max_seq_len = int(seq_lens.max().item())
-    max_num_chunks = (max_seq_len + chunk_size - 1) // chunk_size
 
+    # B200-oriented launch policy:
+    # - short sequences: smaller chunks reduce wasted work, larger V tile reduces grid size
+    # - medium sequences: keep the current baseline
+    # - long sequences: larger chunks reduce loop/control overhead, more warps help throughput
+    if max_seq_len <= 128:
+        chunk_size = 32
+        block_v = 64
+        num_warps = 4
+    elif max_seq_len <= 512:
+        chunk_size = 64
+        block_v = 32
+        num_warps = 4
+    else:
+        chunk_size = 128
+        block_v = 32
+        num_warps = 8
+
+    num_v_tiles = head_size // block_v
+    max_num_chunks = (max_seq_len + chunk_size - 1) // chunk_size
     grid = (num_seqs * num_v_heads * num_v_tiles,)
 
     gdn_prefill_chunk_kernel[grid](
@@ -462,11 +476,12 @@ def gdn_prefill(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output=
         max_num_chunks,
         HEAD_SIZE=head_size,
         CHUNK_SIZE=chunk_size,
-        BLOCK_V=BLOCK_V,
+        BLOCK_V=block_v,
         NUM_V_HEADS=num_v_heads,
         HEAD_RATIO=head_ratio,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=1,
     )
+
 
     return output, new_state
