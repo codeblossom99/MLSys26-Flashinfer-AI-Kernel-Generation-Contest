@@ -290,6 +290,7 @@ def gdn_prefill(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output=
     BLOCK_V = 32
     BLOCK_T = 16  # Chunk length; must be a compile-time constant, >=16 for TC.
     num_v_tiles = head_size // BLOCK_V
+
     grid = (num_seqs * num_v_heads * num_v_tiles,)
 
     gdn_prefill_chunk_kernel[grid](
