@@ -37,11 +37,11 @@ image = (
 GPU_FALLBACK = ["B200"]
 
 
-@app.function(image=image, gpu=GPU_FALLBACK, timeout=3600, volumes={VOLUME_MOUNT_PATH: trace_volume})
+@app.function(image=image, gpu=GPU_FALLBACK, timeout=10800, volumes={VOLUME_MOUNT_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=1, iterations=5, num_trials=3)
+        config = BenchmarkConfig(warmup_runs=1, iterations=10, num_trials=2)
 
     # Try trace set path; fallback to volume root if empty (e.g. put mlsys26-contest contents at root)
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
