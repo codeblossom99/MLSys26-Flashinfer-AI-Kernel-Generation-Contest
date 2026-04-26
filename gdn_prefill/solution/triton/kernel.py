@@ -170,16 +170,32 @@ def gdn_prefill_chunk_kernel(
         G = tl.sum(gamma * last_mask_f)
         log_G = tl.sum(log_gamma * last_mask_f)
 
-        # ---- K @ S_0^T: [BLOCK_T, BLOCK_V] (bf16 @ bf16 -> fp32 via HMMA.BF16) ----
-        # Convert S to bf16 for Tensor Core; output accumulates in fp32.
+        # ---- FP8 quantize metadata (per-chunk absmax) ----
+        fp8_max = 448.0  # e4m3fn dynamic range (approx)
+        q_absmax = tl.maximum(tl.max(tl.max(tl.abs(Q_fp32), axis=1), axis=0), 1e-6)
+        k_absmax = tl.maximum(tl.max(tl.max(tl.abs(K_fp32), axis=1), axis=0), 1e-6)
+        s_absmax = tl.maximum(tl.max(tl.max(tl.abs(S), axis=1), axis=0), 1e-6)
+        q_scale = fp8_max / q_absmax
+        k_scale = fp8_max / k_absmax
+        s_scale = fp8_max / s_absmax
+        inv_q_scale = 1.0 / q_scale
+        inv_k_scale = 1.0 / k_scale
+        inv_s_scale = 1.0 / s_scale
         S_bf16 = S.to(tl.bfloat16)
-        KS0T = tl.dot(K_bf16, tl.trans(S_bf16))  # HMMA.BF16.F32
+        Q_fp8 = tl.maximum(tl.minimum(Q_fp32 * q_scale, fp8_max), -fp8_max).to(tl.float8e4nv)
+        K_fp8 = tl.maximum(tl.minimum(K_fp32 * k_scale, fp8_max), -fp8_max).to(tl.float8e4nv)
+        S_fp8 = tl.maximum(tl.minimum(S * s_scale, fp8_max), -fp8_max).to(tl.float8e4nv)
+
+        # ---- K @ S_0^T: [BLOCK_T, BLOCK_V] ----
+        # Keep recurrence-driving term on bf16 path for stability.
+        KS0T = tl.dot(K_bf16, tl.trans(S_bf16))
 
         # rhs[t] = beta[t] * (V[t] - gamma[t] * KS0T[t])
         rhs = beta[:, None] * (V - gamma[:, None] * KS0T)
 
-        # ---- K @ K^T: [BLOCK_T, BLOCK_T] (bf16 @ bf16 -> fp32 via HMMA.BF16) ----
-        KKT = tl.dot(K_bf16, tl.trans(K_bf16))  # HMMA.BF16.F32
+        # ---- K @ K^T: [BLOCK_T, BLOCK_T] ----
+        # Keep similarity matrix in bf16 path for numerical stability.
+        KKT = tl.dot(K_bf16, tl.trans(K_bf16))
 
         # gamma_ratio[t, j] = gamma[t] / gamma[j] = exp(log_gamma[t] - log_gamma[j])
         # Bidirectional clamp to avoid overflow/underflow in exp
@@ -202,10 +218,10 @@ def gdn_prefill_chunk_kernel(
             U = tl.where(row_bool[:, None], U_new[None, :], U)
 
         # ---- Output: scale * (gamma * (Q @ S_0^T) + B @ U') ----
-        # Q @ S^T: bf16 @ bf16 -> fp32 via HMMA.BF16
-        Out_inter = tl.dot(Q_bf16, tl.trans(S_bf16))                       # [BLOCK_T, BLOCK_V]
-        # Q @ K^T: bf16 @ bf16 -> fp32 via HMMA.BF16
-        QKT = tl.dot(Q_bf16, tl.trans(K_bf16))                             # [BLOCK_T, BLOCK_T]
+        # Q @ S^T and Q @ K^T
+        Out_inter = tl.dot(Q_fp8, tl.trans(S_fp8)) * (inv_q_scale * inv_s_scale)
+        # Keep QKT in bf16 path for better stability in triangular solve output.
+        QKT = tl.dot(Q_bf16, tl.trans(K_bf16))
         B_mat = tl.where(tril_incl, gamma_ratio * QKT, 0.0)                # [BLOCK_T, BLOCK_T]
         # B_mat @ U: B_mat is fp32, U is fp32 - convert to bf16 for TC
         Out_intra = tl.dot(B_mat.to(tl.bfloat16), U.to(tl.bfloat16))       # [BLOCK_T, BLOCK_V]
@@ -222,8 +238,10 @@ def gdn_prefill_chunk_kernel(
         dlog_end = tl.maximum(tl.minimum(dlog_end, 88.0), -88.0)           # Bidirectional clamp
         G_over_gamma = tl.exp(dlog_end)                                    # [BLOCK_T]
         W = G_over_gamma[:, None] * U                                      # [BLOCK_T, BLOCK_V]
-        # W^T @ K: bf16 @ bf16 -> fp32 via HMMA.BF16
-        dS = tl.dot(tl.trans(W.to(tl.bfloat16)), K_bf16)                   # [BLOCK_V, HEAD_SIZE]
+        # W^T @ K
+        # NOTE: fp8 tl.dot requires K >= 32 on this Triton path. Here K=BLOCK_T=16,
+        # so keep this matmul on bf16 tensor cores to avoid compilation failure.
+        dS = tl.dot(tl.trans(W.to(tl.bfloat16)), K_bf16)
         S = G * S + dS
 
         chunk_idx += 1
