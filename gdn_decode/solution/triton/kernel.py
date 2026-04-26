@@ -120,22 +120,15 @@ def gdn_decode_kernel(
     pid_qk_head = pid_v_head // head_ratio
 
     # --- gate scalars ---
-    # Mixed precision gate path: keep recurrent state math in fp32,
-    # but reduce gate input precision to lower instruction/memory pressure.
-    A_log_val_bf16 = tl.load(A_log_ptr + pid_v_head).to(tl.bfloat16)
-    dt_bias_val_bf16 = tl.load(DT_bias_ptr + pid_v_head).to(tl.bfloat16)
-    a_val_bf16 = tl.load(
-        A_ptr + pid_batch * stride_a_b + pid_seq * stride_a_s + pid_v_head * stride_a_h
-    ).to(tl.bfloat16)
-    b_val_bf16 = tl.load(
-        B_ptr + pid_batch * stride_b_b + pid_seq * stride_b_s + pid_v_head * stride_b_h
-    ).to(tl.bfloat16)
+    A_log_val = tl.load(A_log_ptr + pid_v_head).to(tl.float32)
+    dt_bias_val = tl.load(DT_bias_ptr + pid_v_head).to(tl.float32)
+    a_val = tl.load(A_ptr + pid_batch * stride_a_b + pid_seq * stride_a_s + pid_v_head * stride_a_h).to(tl.float32)
+    b_val = tl.load(B_ptr + pid_batch * stride_b_b + pid_seq * stride_b_s + pid_v_head * stride_b_h).to(tl.float32)
 
-    x_bf16 = a_val_bf16 + dt_bias_val_bf16
-    x = x_bf16.to(tl.float32)
+    x = a_val + dt_bias_val
     softplus_x = tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(x)))
-    alpha = tl.exp(-tl.exp(A_log_val_bf16.to(tl.float32)) * softplus_x)
-    beta = tl.sigmoid(b_val_bf16.to(tl.float32))
+    alpha = tl.exp(-tl.exp(A_log_val) * softplus_x)
+    beta = tl.sigmoid(b_val)
 
     # --- V-dimension tile offsets ---
     v_off = pid_v_tile * BLOCK_V + tl.arange(0, BLOCK_V)
@@ -155,9 +148,7 @@ def gdn_decode_kernel(
 
     # Accumulators across K chunks
     old_v_acc = tl.zeros((BLOCK_V,), dtype=tl.float32)
-    old_out_acc = tl.zeros((BLOCK_V,), dtype=tl.float32)
     out_acc = tl.zeros((BLOCK_V,), dtype=tl.float32)
-    qk_dot = tl.zeros((), dtype=tl.float32)
 
     if BLOCK_K == HEAD_SIZE:
         # --- Single-pass: full K in one block, no loop ---
@@ -173,12 +164,10 @@ def gdn_decode_kernel(
 
         old_state_chunk = alpha * state_chunk
         old_v_acc = tl.sum(old_state_chunk * k_chunk[None, :], axis=1)
-        old_out_acc = tl.sum(old_state_chunk * q_chunk[None, :], axis=1)
-        qk_dot = tl.sum(q_chunk * k_chunk, axis=0)
         new_v = beta * v_vec + (1.0 - beta) * old_v_acc
         delta_v = new_v - old_v_acc
         new_state_chunk = old_state_chunk + k_chunk[None, :] * delta_v[:, None]
-        out_acc = old_out_acc + qk_dot * delta_v
+        out_acc = tl.sum(new_state_chunk * q_chunk[None, :], axis=1)
 
         ns_ptrs = (ns_base
                   + v_off[:, None] * stride_ns_v
@@ -199,17 +188,15 @@ def gdn_decode_kernel(
 
             old_state_chunk = alpha * state_chunk
             old_v_acc += tl.sum(old_state_chunk * k_chunk[None, :], axis=1)
-            old_out_acc += tl.sum(old_state_chunk * q_chunk[None, :], axis=1)
-            qk_dot += tl.sum(q_chunk * k_chunk, axis=0)
 
         new_v = beta * v_vec + (1.0 - beta) * old_v_acc
         delta_v = new_v - old_v_acc
-        out_acc = old_out_acc + qk_dot * delta_v
 
         for k_start in tl.static_range(0, HEAD_SIZE, BLOCK_K):
             k_off = k_start + tl.arange(0, BLOCK_K)
             k_mask = k_off < HEAD_SIZE
 
+            q_chunk = tl.load(q_base + k_off * stride_q_d, mask=k_mask, other=0.0).to(tl.float32)
             k_chunk = tl.load(k_base + k_off * stride_k_d, mask=k_mask, other=0.0).to(tl.float32)
             state_ptrs = (state_base
                          + v_off[:, None] * stride_state_v
@@ -218,6 +205,7 @@ def gdn_decode_kernel(
 
             old_state_chunk = alpha * state_chunk
             new_state_chunk = old_state_chunk + k_chunk[None, :] * delta_v[:, None]
+            out_acc += tl.sum(new_state_chunk * q_chunk[None, :], axis=1)
 
             ns_ptrs = (ns_base
                       + v_off[:, None] * stride_ns_v
@@ -256,8 +244,7 @@ def gdn_decode(
         output = torch.empty(batch_size, seq_len, num_v_heads, head_size,
                             dtype=torch.bfloat16, device=q.device)
     if new_state is None:
-        new_state = torch.empty(batch_size, num_v_heads, head_size, head_size,
-                                dtype=torch.float32, device=q.device)
+        new_state = torch.empty_like(state)
 
     def grid(META):
         num_v_tiles = triton.cdiv(head_size, META['BLOCK_V'])
